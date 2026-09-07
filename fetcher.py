@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -51,8 +52,37 @@ def _browser(headless: bool = True) -> Iterator:
             browser.close()
 
 
-def fetch_events(headless: bool = True, wait_ms: int = 4000) -> list[dict]:
-    """Возвращает список событий или поднимает исключение."""
+def fetch_events(headless: bool = True, wait_ms: int = 4000, max_attempts: int = 3) -> list[dict]:
+    """Возвращает список событий или поднимает исключение.
+
+    ServicePipe на части IP пропускает только браузер с признаками
+    «живого» пользователя — иначе возвращает challenge-страницу со
+    спиннером и не показывает React-приложение. Поэтому:
+
+    * эмулируем небольшую прокрутку и движение мыши,
+    * при таймауте делаем до ``max_attempts`` повторных попыток,
+    * ждём дольше (``wait_ms`` применяется и как post-load слип, и
+      как запас на challenge).
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        log.info("Попытка %d/%d открыть сайт", attempt, max_attempts)
+        try:
+            events = _try_fetch_once(headless=headless, wait_ms=wait_ms)
+            return events
+        except RuntimeError as exc:
+            last_error = exc
+            log.warning("Попытка %d не удалась: %s", attempt, exc)
+            # перед следующей попыткой — пауза, чтобы ServicePipe «забыл» пометку
+            time.sleep(3 * attempt)
+
+    raise RuntimeError(
+        f"Не удалось получить события после {max_attempts} попыток: {last_error}"
+    )
+
+
+def _try_fetch_once(headless: bool, wait_ms: int) -> list[dict]:
     with _browser(headless=headless) as browser:
         # Минимальный набор параметров, поддерживаемый всеми актуальными
         # версиями Playwright. ``timezone``/``locale`` опускаем намеренно:
@@ -72,33 +102,4 @@ def fetch_events(headless: bool = True, wait_ms: int = 4000) -> list[dict]:
         log.info("Открываю %s", SITE_URL)
         page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30_000)
 
-        # Дожидаемся появления хотя бы одной карточки события.
-        try:
-            page.wait_for_selector("a[href*='/v2/event/']", timeout=15_000)
-        except PlaywrightTimeoutError as exc:
-            raise RuntimeError(
-                "ServicePipe не пропустил запрос или сайт изменил вёрстку: "
-                "не дождались карточек событий"
-            ) from exc
-
-        # Дополнительно даём React-приложению подтянуть данные.
-        page.wait_for_timeout(wait_ms)
-
-        # Забираем JSON событий прямо в контексте страницы — обходит любые
-        # IP/cookie-проверки на этом домене.
-        log.info("Запрашиваю %s через page context", API_URL)
-        raw = page.evaluate(
-            """async (url) => {
-                const r = await fetch(url, { credentials: 'include' });
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return await r.text();
-            }""",
-            API_URL,
-        )
-
-        ctx.close()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Не удалось разобрать ответ API: {exc}; первые 200 символов: {raw[:200]!r}") from exc
+        # Если S
