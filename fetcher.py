@@ -102,4 +102,73 @@ def _try_fetch_once(headless: bool, wait_ms: int) -> list[dict]:
         log.info("Открываю %s", SITE_URL)
         page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30_000)
 
-        # Если S
+        # Если ServicePipe оставил challenge-страницу — на ней виден
+        # спиннер ``#id_spinner``. Эмулируем поведение пользователя:
+        # прокрутка + движение мышью. Это снимает поведенческий фильтр
+        # на части IP-адресов.
+        try:
+            has_challenge = page.evaluate(
+                "() => !!document.querySelector('#id_spinner') || /servicepipe/i.test(document.body.innerHTML)"
+            )
+        except Exception:
+            has_challenge = False
+        if has_challenge:
+            log.info("Обнаружен challenge-спиннер, эмулирую прокрутку/мышь")
+            try:
+                page.mouse.move(640, 400)
+                page.mouse.move(700, 420, steps=5)
+                page.evaluate("window.scrollTo(0, 300)")
+                page.wait_for_timeout(1500)
+                page.evaluate("window.scrollTo(0, 0)")
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Эмуляция поведения не удалась: %s", exc)
+
+        # Дожидаемся отрисовки React-приложения. На странице должна быть
+        # хотя бы одна ссылка на конкретное событие.
+        try:
+            page.wait_for_selector(
+                "a[href*='/v2/event/']",
+                state="attached",
+                timeout=30_000,
+            )
+        except PlaywrightTimeoutError as exc:
+            # Диагностируем: что именно сейчас на странице
+            current_url = page.url
+            try:
+                content_preview = page.content()[:600]
+            except Exception:  # noqa: BLE001
+                content_preview = "(не удалось получить содержимое)"
+            log.error(
+                "Карточки событий не появились. URL=%s, фрагмент страницы: %s",
+                current_url,
+                content_preview,
+            )
+            raise RuntimeError(
+                "ServicePipe не пропустил запрос или сайт изменил вёрстку: "
+                "не дождались карточек событий "
+                f"(текущий URL: {current_url})"
+            ) from exc
+
+        # Дополнительно даём React-приложению подтянуть данные.
+        page.wait_for_timeout(wait_ms)
+
+        # Забираем JSON событий прямо в контексте страницы — обходит любые
+        # IP/cookie-проверки на этом домене.
+        log.info("Запрашиваю %s через page context", API_URL)
+        raw = page.evaluate(
+            """async (url) => {
+                const r = await fetch(url, { credentials: 'include' });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return await r.text();
+            }""",
+            API_URL,
+        )
+
+        ctx.close()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Не удалось разобрать ответ API: {exc}; первые 200 символов: {raw[:200]!r}"
+        ) from exc
